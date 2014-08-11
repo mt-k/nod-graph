@@ -1,0 +1,670 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<script src="http://d3js.org/d3.v2.js"></script>
+		<style type="text/css">
+body {
+	margin: 0px;
+	padding: 0px;
+	font: 10px sans-serif;
+}
+
+.node > circle {
+	fill: lightsteelblue;
+	stroke: #555;
+	stroke-width: 3px;
+}
+
+.node.hover > circle {
+	stroke: #0000A7 !important;
+	fill: #FFFFFF !important;
+}
+
+.node.parentHover > circle {
+	stroke: #00A700 !important;
+}
+
+.leaf > circle {
+	stroke: #fff;
+	stroke-width: 1.5px;
+}
+
+.node > .top-label:nth-child(2) {
+	text-anchor: end;
+}
+
+.node > .top-label:nth-child(3) {
+	text-anchor: start;
+}
+
+.node > .top-label:last-child {
+	text-anchor: start;
+}
+
+path.hull {
+	fill: lightsteelblue;
+	fill-opacity: 0.3;
+}
+line.link {
+	stroke: #333;
+	stroke-opacity: 0.5;
+	pointer-events: none;
+}
+
+.link.hover {
+	stroke: #00A700;
+}
+		</style>
+	</head>
+	<body>
+		<script type="text/javascript">
+		
+var w = window,
+	d = document,
+	e = d.documentElement,
+	g = d.getElementsByTagName('body')[0],
+	documentWidth = w.innerWidth || e.clientWidth || g.clientWidth,
+	documentHeight = w.innerHeight || e.clientHeight || g.clientHeight
+	;
+		
+var border = 100,	//space for labels
+	width = documentWidth - 2*border, // svg width
+	height = documentHeight - 2*border,	// svg height
+	borderMargin = 10, //margin of labels
+	dr = 4,			// default point radius
+	off = 15,		// cluster hull offset
+	expand = {}, // expanded clusters
+	nodeMap = d3.map(),
+	linkMap = d3.map(),
+	fontSize = 10,
+	blacklist =	{},
+	topNodesByGroup = {},
+	linksByNode = {},
+	data, net, force, hullg, hull, linkg, link, nodeg, node, texts
+	;
+
+var curve = d3.svg.line()
+		.interpolate("cardinal-closed")
+		.tension(.85);
+ 
+var fill = d3.scale.category20();
+
+/*
+Tick callback
+*/
+	function tick() {
+		var hulls = [];
+		
+		if (!hull.empty()) {
+			hulls = convexHulls(net.nodes, getGroup, off);
+			
+			hull.data(hulls)
+					.attr("d", drawCluster);
+		}
+						
+		//Restrict to rectangle		
+		node
+			.attr("transform", function(d) {
+				if(d.x < border)
+					d.x = border;
+				else if(d.x > width + border)
+					d.x = width + border;
+				
+				if(d.y < border)
+					d.y = border;
+				else if(d.y > height + border)
+					d.y = height + border;
+				
+				return 'translate(' + d.x + ',' + d.y + ')'; 
+			});
+	
+		link.attr("x1", function(d) { return d.source.x; })
+				.attr("y1", function(d) { return d.source.y; })
+				.attr("x2", function(d) { return d.target.x; })
+				.attr("y2", function(d) { return d.target.y; });
+		
+		texts.attr("transform", function(d) {
+			if(d.x == border){
+				return "translate(" + (border - borderMargin) + "," + d.y + ")";	
+			}
+			if(d.x == width + border){
+				return "translate(" + (d.x + borderMargin) + "," + d.y + ")";	
+			}
+			if(d.y == border){
+				return "translate(" + d.x + "," + (border - borderMargin) + ")rotate(90)";	
+			}
+			if(d.y == height + border){
+				return "translate(" + d.x + "," + (height + border + borderMargin) + ")rotate(90)";	
+			}
+			return "translate(" + d.x + "," + d.y + ")";
+		}).attr("width", function(d) {
+			if(d.x == border){
+				return border;	
+			}
+			if(d.x == width + border){
+				return border;	
+			}
+			return null;
+		}).attr("height", function(d) {
+			if(d.y == border){
+				return border;	
+			}
+			if(d.y == height + border){
+				return border;	
+			}
+			return null
+		}).style("text-anchor", function(d) {
+			if(d.x == border){
+				return 'end';
+			}
+			if(d.x == width + border){
+				return 'start';	
+			}
+			if(d.y == border){
+				return 'end';
+			}
+			if(d.y == height + border){
+				return 'start';	
+			}
+			return 'start';
+		})
+		;
+	}
+
+/*
+Zoom behavior
+*/
+var zoomBehavior = d3.behavior.zoom()
+	.scaleExtent([1, 5])
+	.on('zoom', zoomed);
+
+/*
+Drag behaviors and callbacks
+*/
+	function nodeDragstarted(d, i){
+		d3.event.sourceEvent.stopPropagation();
+		force.stop();
+	}
+	
+	function nodeDragMove(d, i){
+		d.px += d3.event.dx;
+		d.py += d3.event.dy;
+		d.x += d3.event.dx;
+		d.y += d3.event.dy;
+		tick();
+	}
+	
+	function nodeDragend(d, i){
+		d.fixed = true;
+		tick();
+		force.resume();
+	}
+	
+	var nodeDragBehavior = d3.behavior.drag()
+		.origin(function(d){ return d; })
+		.on('dragstart', nodeDragstarted)
+		.on('drag', nodeDragMove)
+		.on('dragend', nodeDragend)
+		;
+		
+	function hullDragstarted(d, i){
+		d3.event.sourceEvent.stopPropagation();
+		force.stop();
+	}
+	
+	function hullDragMove(d, i){
+		//Move all nodes in the hull
+		var group = d.group;
+	
+		node.each(function(nd, ni){
+			if(nd.group == group){
+				nd.px += d3.event.dx;
+				nd.py += d3.event.dy;
+				nd.x += d3.event.dx;
+				nd.y += d3.event.dy;
+			}
+		});
+		tick();
+	}
+	
+	function hullDragend(d, i){
+		var group = d.group;
+	
+		node.each(function(nd, ni){
+			if(nd.group == group){
+				nd.fixed = true;
+			}
+		});
+	
+		tick();
+		force.resume();
+	}
+	
+	var hullDragBehavior = d3.behavior.drag()
+		.origin(function(d){ return d; })
+		.on('dragstart', hullDragstarted)
+		.on('drag', hullDragMove)
+		.on('dragend', hullDragend)
+		;
+
+/*
+Hover
+*/
+function handleNodeOver(d){
+	//console.log('hover');
+	var node = d3.select('#node-' + d.elementId);
+	node.classed({hover: true});
+	
+	linksByNode[d.elementId].forEach(function(l){
+		d3.select('#link-' + l.elementId).classed({hover: true});
+		if(l.target.elementId != d.elementId){
+			d3.select('#node-' + l.target.elementId).classed({parentHover: true});
+		}
+		if(l.source.elementId != d.elementId){
+			d3.select('#node-' + l.source.elementId).classed({parentHover: true});
+		}
+	});
+}
+
+function handleNodeOut(d){
+	var node = d3.select('#node-' + d.elementId);
+	node.classed({hover: false});
+	
+	linksByNode[d.elementId].forEach(function(l){
+		d3.select('#link-' + l.elementId).classed({hover: false});
+		if(l.target.elementId != d.elementId){
+			d3.select('#node-' + l.target.elementId).classed({parentHover: false});
+		}
+		if(l.source.elementId != d.elementId){
+			d3.select('#node-' + l.source.elementId).classed({parentHover: false});
+		}
+	});
+}
+
+
+function getTopLabels(group){
+	if(typeof topNodesByGroup[group] == 'undefined')
+		return [];
+	
+	var ret = [];
+	
+	for(var i = 0;i < Math.min(topNodesByGroup[group].length, 3); i++){
+		var nodeId = topNodesByGroup[group][i];
+		ret.push(nodeMap.get(nodeId).name);
+	}
+	
+	return ret;
+}
+
+function noop() { return false; }
+ 
+function nodeid(n) {
+	return n.size ? "_g_"+n.group : n.name;
+}
+ 
+function linkid(l) {
+	var u = nodeid(l.source),
+			v = nodeid(l.target);
+	return u<v ? u+"|"+v : v+"|"+u;
+}
+ 
+function getGroup(n) { return n.group; }
+ 
+// constructs the network to visualize
+function network(data, prev, index, expand) {
+	expand = expand || {};
+	var gm = {},		// group map
+			nm = {},		// node map
+			lm = {},		// link map
+			gn = {},		// previous group nodes
+			gc = {},		// previous group centroids
+			nodes = [], // output nodes
+			links = []; // output links
+ 
+	// process previous nodes for reuse or centroid calculation
+	if (prev) {
+		prev.nodes.forEach(function(n) {
+			var i = index(n), o;
+			if (n.size > 0) {
+				gn[i] = n;
+				n.size = 0;
+			} else {
+				o = gc[i] || (gc[i] = {x:0,y:0,count:0});
+				o.x += n.x;
+				o.y += n.y;
+				o.count += 1;
+			}
+		});
+	}
+ 
+	// determine nodes
+	for (var k=0; k<data.nodes.length; ++k) {
+		var n = data.nodes[k],
+				i = index(n),
+				l = gm[i] || (gm[i]=gn[i]) || (gm[i]={group:i, size:0, nodes:[]});
+ 
+		if (expand[i]) {
+			// the node should be directly visible
+			nm[n.name] = nodes.length;
+			nodes.push(n);
+			if (gn[i]) {
+				// place new nodes at cluster location (plus jitter)
+				n.x = gn[i].x + Math.random();
+				n.y = gn[i].y + Math.random();
+			}
+		} else {
+			// the node is part of a collapsed cluster
+			if (l.size == 0) {
+				// if new cluster, add to set and position at centroid of leaf nodes
+				nm[i] = nodes.length;
+				nodes.push(l);
+				if (gc[i]) {
+					l.x = gc[i].x / gc[i].count;
+					l.y = gc[i].y / gc[i].count;
+				}
+			}
+			l.nodes.push(n);
+		}
+	// always count group size as we also use it to tweak the force graph strengths/distances
+		l.size += 1;
+		n.group_data = l;
+	}
+ 
+	for (i in gm) { gm[i].link_count = 0; }
+ 
+	// determine links
+	for (k=0; k<data.links.length; ++k) {
+		var e = data.links[k],
+				u = index(e.source),
+				v = index(e.target);
+
+		if (u != v) {
+			gm[u].link_count++;
+			gm[v].link_count++;
+		}
+		u = expand[u] ? nm[e.source.name] : nm[u];
+		v = expand[v] ? nm[e.target.name] : nm[v];
+		var i = (u<v ? u+"|"+v : v+"|"+u),
+				l = lm[i] || (lm[i] = {source:u, target:v, size:0});
+
+		l.size += 1;
+	}
+	for (i in lm) { links.push(lm[i]); }
+ 
+	return {nodes: nodes, links: links};
+}
+ 
+function convexHulls(nodes, index, offset) {
+	var hulls = {};
+ 
+	// create point sets
+	for (var k=0; k<nodes.length; ++k) {
+		var n = nodes[k];
+		if (n.size) continue;
+		var i = index(n),
+				l = hulls[i] || (hulls[i] = []);
+		l.push([n.x-offset, n.y-offset]);
+		l.push([n.x-offset, n.y+offset]);
+		l.push([n.x+offset, n.y-offset]);
+		l.push([n.x+offset, n.y+offset]);
+	}
+ 
+	// create convex hulls
+	var hullset = [];
+	for (i in hulls) {
+		hullset.push({group: i, path: d3.geom.hull(hulls[i])});
+	}
+ 
+	return hullset;
+}
+ 
+function drawCluster(d) {
+	return curve(d.path); // 0.8
+}
+
+function preprocess(data) {
+	var gm = {},
+	blacklist = {},
+	nodes = [],
+	links = []
+
+	// D3 uses the the object indices in array instead of their actual ids;
+	// create maps of nodes and links by id
+	data.nodes.forEach(function(n) {
+		nodeMap.set(n.id, n)
+	});
+	// Replace source and target attributes (represented by ids) by the actual objects.
+	data.links.forEach(function(l) {
+		l.source = nodeMap.get(l.source);
+		l.target = nodeMap.get(l.target);
+	});
+	
+	data.nodes.forEach(function(n) {
+		l = gm[n.group] || (gm[n.group]={nodes:[]}); 
+		l.nodes.push(n)
+	});
+
+	for (i in gm) {
+		gm[i].nodes.forEach(function(n) {
+			if(n.zoom != 0)
+				blacklist[n.id] = true
+			else
+				nodes.push(n)
+		});
+	}
+	data.nodes = nodes;
+
+	data.links.forEach(function(e) {
+			if(!(blacklist[e.source.id] || blacklist[e.target.id])) links.push(e)
+	});
+	data.links = links;
+	
+	//Find most important nodes for each cluster
+	data.groups.forEach(function(group){
+		for(var groupId in group){
+			topNodesByGroup[groupId] = group[groupId];
+		}
+	});
+}
+ 
+// --------------------------------------------------------
+ 
+var body = d3.select("body");
+ 
+var vis = body.append("svg")
+	 .attr("width", width + 200)
+	 .attr("height", height + 200);
+	 
+vis.call(zoomBehavior);
+	 
+var container = vis.append('g')
+	.attr("x", 100)
+	.attr("y", 100)
+	.attr("width", width)
+	.attr("height", height);
+ 
+d3.json("miserables4.json", function(json) {
+	data = json;
+	preprocess(data)
+ 
+	hullg = container.append("g");
+	linkg = container.append("g");
+	nodeg = container.append("g");
+ 
+	init();
+ 
+	container.attr("opacity", 1e-6)
+		.transition()
+			.duration(1000)
+			.attr("opacity", 1);
+});
+ 
+function init() {
+	if (force) force.stop();
+ 	console.log(data.nodes.length)
+	net = network(data, net, getGroup, expand);
+	force = d3.layout.force()
+			.nodes(net.nodes)
+			.links(net.links)
+			.size([width, height])
+			.linkDistance(function(l, i) {
+					var n1 = l.source, n2 = l.target;
+				// larger distance for bigger groups:
+				// both between single nodes and _other_ groups (where size of own node group still counts),
+				// and between two group nodes.
+				//
+				// reduce distance for groups with very few outer links,
+				// again both in expanded and grouped form, i.e. between individual nodes of a group and
+				// nodes of another group or other group node or between two group nodes.
+				//
+				// The latter was done to keep the single-link groups ('blue', rose, ...) close.
+				return 30 +
+					Math.min(20 * Math.min((n1.size || (n1.group != n2.group ? n1.group_data.size : 0)),
+																 (n2.size || (n1.group != n2.group ? n2.group_data.size : 0))),
+							 -30 +
+							 30 * Math.min((n1.link_count || (n1.group != n2.group ? n1.group_data.link_count : 0)),
+														 (n2.link_count || (n1.group != n2.group ? n2.group_data.link_count : 0))),
+							 100);
+		})
+		.linkStrength(function(l, i) {
+				return 1;
+		})
+		.gravity(0.2)	 // gravity+charge tweaked to ensure good 'grouped' view (e.g. green group not smack between blue&orange, ...
+		.charge(-600)		// ... charge is important to turn single-linked groups to the outside
+		.start();
+ 
+	hullg.selectAll("path.hull").remove();
+	hull = hullg.selectAll("path.hull")
+			.data(convexHulls(net.nodes, getGroup, off))
+		.enter().append("path")
+			.attr("class", "hull")
+			.attr("d", drawCluster)
+			.style("fill", function(d) { return fill(d.group); })
+			.on("click", function(d) {
+				console.log("hull click", d, arguments, this, expand[d.group]);
+				expand[d.group] = false; init();
+	 	 	});
+	 	 	 
+	link = linkg.selectAll("line.link").data(net.links, linkid);
+	link.exit().remove();
+	link.enter().append("line")
+			.attr("id", function(d){
+				var src = d.source.id;
+				if(typeof d.source.id == 'undefined')
+					src = 'g' + d.source.group;
+			
+				var tgt = d.target.id;
+				if(typeof d.target.id == 'undefined')
+					tgt = 'g' + d.target.group;
+			
+				d.elementId = src + '-' + tgt;
+			
+				return 'link-' + src + '-' + tgt;
+			})
+			.attr("class", "link")
+			.attr("x1", function(d) { return d.source.x; })
+			.attr("y1", function(d) { return d.source.y; })
+			.attr("x2", function(d) { return d.target.x; })
+			.attr("y2", function(d) { return d.target.y; })
+			.style("stroke-width", function(d) { return d.size || 1; });
+			
+	link.each(function(d){
+		var src = d.source.id;
+		if(typeof d.source.id == 'undefined')
+			src = 'g' + d.source.group;
+	
+		var tgt = d.target.id;
+		if(typeof d.target.id == 'undefined')
+			tgt = 'g' + d.target.group;
+		
+		if(typeof linksByNode[src] == 'undefined')
+			linksByNode[src] = [];
+		linksByNode[src].push(d);
+		
+		if(typeof linksByNode[tgt] == 'undefined')
+			linksByNode[tgt] = [];
+		linksByNode[tgt].push(d);
+	});
+
+	node = nodeg.selectAll("g.node").data(net.nodes, nodeid);
+	node.exit().remove();
+	node.enter().append("g")
+			.attr("id", function(d){
+				var id = d.id;
+				if(typeof d.id == 'undefined')
+					id = 'g' + d.group;
+			
+				d.elementId = id;
+			
+				return 'node-' + id;
+			})
+			// if (d.size) -- d.size > 0 when d is a group node.
+			.attr("class", function(d) { return "node" + (d.size?"":" leaf"); })
+			.attr("transform", function(d) { return 'translate(' + d.x + ',' + d.y + ')'; })
+			.on("click", function(d) {
+					console.log("node click", d, arguments, this, expand[d.group]);
+					expand[d.group] = !expand[d.group];
+					init();
+			}).append('circle')
+				.attr("r", function(d) { return d.size ? d.size + dr : dr+1; })
+				.style("fill", function(d) { return fill(d.group); })
+			.on('mouseover', handleNodeOver)
+			.on('mouseout', handleNodeOut)
+			;
+				
+	node.each(function(d){
+				if(d.size){
+					var topLabels = d3.select(this).selectAll('text').data(getTopLabels(d.group));
+					topLabels.exit().remove();
+					topLabels.enter()
+						.append('svg:text')
+							.attr("class", "top-label")
+							.attr("fill", "black")
+							.text(function(d){ return d; })
+							.attr("y", function(d, i){
+								if(i == 0)
+									return 0;
+								else if(i == 1)
+									return -10;
+								else if(i == 2)
+									return 10;
+							})
+							.attr("font-size", function(){
+								if(i == 0)
+									return 0;
+								else if(i == 1)
+									return -10;
+								else if(i == 2)
+									return 10;
+							});
+					
+					
+				}	
+			});
+	
+
+	texts = container.selectAll("text.label").data(net.nodes, nodeid)
+	texts.exit().remove();
+	texts.enter().append("text")
+							 .attr("class", "label")
+							 .attr("fill", "black")
+							 .text(function(d) {	return d.name;	});
+ 
+	node.call(nodeDragBehavior);
+	texts.call(nodeDragBehavior);
+	
+	hull.call(hullDragBehavior);
+ 
+	force.on("tick", tick);
+}
+
+function zoomed(){
+	container.attr("transform", "translate(" + d3.event.translate + ")scale(" + d3.event.scale + ")");
+	
+	texts.style("font-size", function(d){
+		return (fontSize / d3.event.scale) + 'px';
+	});
+}	 
+		</script>
+	</body>
+</html>
